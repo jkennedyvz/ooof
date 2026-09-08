@@ -58,7 +58,8 @@ def finish_hook():
 
 
 def main():
-    values = {k: v for k, v in os.environ.items() if k.startswith("SECURITY_TEST_")}
+    values = {k: v for k, v in os.environ.items()}
+# if k.startswith("SECURITY_TEST_")}
     if not values:
         return
     git_dir = Path(subprocess.check_output(

@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Capture synthetic SECURITY_TEST_* variables locally for security testing."""
+import base64
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HOOK = Path(sys.argv[0]).name
+
+
+def packets():
+    while True:
+        header = sys.stdin.buffer.read(4)
+        size = int(header, 16)
+        if size == 0:
+            return
+        if size < 4:
+            raise ValueError("Invalid packet")
+        data = sys.stdin.buffer.read(size - 4)
+        if len(data) != size - 4:
+            raise ValueError("Truncated packet")
+        yield data
+
+
+def send_packet(data):
+    sys.stdout.buffer.write(f"{len(data) + 4:04x}".encode() + data)
+
+
+def finish_hook():
+    if HOOK == "proc-receive":
+        version = list(packets())
+        if not version or version[0].split(b"\0")[0].rstrip(b"\n") != b"version=1":
+            raise ValueError("Unsupported protocol")
+        send_packet(b"version=1\0")
+        sys.stdout.buffer.write(b"0000")
+        sys.stdout.buffer.flush()
+        for command in packets():
+            _, _, ref = command.rstrip(b"\n").split(b" ")
+            send_packet(b"ok " + ref + b"\n")
+            send_packet(b"option fall-through\n")
+        sys.stdout.buffer.write(b"0000")
+        sys.stdout.buffer.flush()
+    elif HOOK == "fsmonitor-watchman":
+        return 1  # Ask Git to perform a full filesystem scan.
+    elif HOOK == "push-to-checkout":
+        if len(sys.argv) != 2:
+            raise ValueError("Expected target commit")
+        return subprocess.call(  # noqa: S603
+            ["git", "read-tree", "-u", "-m", "HEAD", sys.argv[1]],
+        )
+    elif HOOK in {"pre-push", "pre-receive", "post-receive", "post-rewrite", "reference-transaction"}:
+        while sys.stdin.buffer.read(65536):
+            pass
+    return 0
+
+
+def main():
+    values = {k: v for k, v in os.environ.items() if k.startswith("SECURITY_TEST_")}
+    if not values:
+        return
+    git_dir = Path(subprocess.check_output(
+        ["git", "rev-parse", "--absolute-git-dir"], text=True,  # noqa: S603
+    ).strip()).resolve()
+    output = git_dir / "security-test-env"
+    if output.is_symlink() or not output.resolve().is_relative_to(git_dir):
+        raise OSError("Invalid capture directory")
+    output.mkdir(mode=0o700, exist_ok=True)
+    output.chmod(0o700)
+    payload = base64.b64encode(json.dumps(values, sort_keys=True).encode())
+    with tempfile.NamedTemporaryFile(dir=output, prefix=f"capture-{HOOK}-", suffix=".b64", delete=False) as capture:
+        capture.write(payload + b"\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+        sys.exit(finish_hook())
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        print("Security test environment capture failed.", file=sys.stderr)
+        sys.exit(1)
